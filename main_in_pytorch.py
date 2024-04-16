@@ -2,7 +2,7 @@ from dataclasses import dataclass
 from functools import partial
 
 import torch
-import functorch
+#import functorch
 
 from matplotlib import pyplot as plt
 import matplotlib
@@ -21,7 +21,7 @@ def setup(
     grid_size: tuple[int, int] = (100, 100),
     start_pos: tuple[int, int] = (20, 20),
     end_pos: tuple[int, int] = (80, 80),
-    volume: float = 20,
+    volume: float = 100,
 ) -> System:
     """Setup the simulation
 
@@ -33,9 +33,9 @@ def setup(
     height = end_pos[1] - start_pos[1]
     n_cells = int(width * height / cell_size**2)
 
-    grid = torch.zeros(grid_size, dtype=torch.int8)
-    types_as_grid = torch.zeros(grid_size, dtype=torch.int8)
-    cell_types = torch.zeros(n_cells + 1, dtype=torch.int8)
+    grid = torch.zeros(grid_size, dtype=torch.int32)
+    types_as_grid = torch.zeros(grid_size, dtype=torch.int32)
+    cell_types = torch.zeros(n_cells + 1, dtype=torch.int32)
     #cell_types[1:] = onp.random.choice([1, 2], size=n_cells)
     cell_types[1:] = torch.bernoulli(torch.empty(n_cells).uniform_(0, 1)) + 1
     cell_index = 1
@@ -48,6 +48,50 @@ def setup(
     return System(grid, cell_types,types_as_grid)
 
 def cell_interaction_energy(
+    cell_id: int,
+    cell_type: int,
+    grid: torch.tensor,
+    cell_types: torch.tensor,
+    types_as_grid: torch.tensor,
+    J: torch.tensor,
+    V: float,
+    lambda_v: float,
+    x: int,
+    y: int,
+) -> float:
+    """Compute the interaction energy of a cell with its neighbors.
+
+    Args:
+        cell_id: The id of the cell.
+        cell_type: The type of the cell.
+        grid: The current system state.
+        cell_types: The cell types of the cells in the system.
+        types_as_grid: Grid mapping types to their locations.
+        J: The interaction matrix between cell types.
+        V: The target volume of the cells.
+        lambda_v: The volume constraint strength.
+        x: The x coordinate of the cell.
+        y: The y coordinate of the cell.
+    """
+    energy = 0
+    max_x, max_y = grid.shape
+
+    # Check neighbors and ensure boundaries are respected
+    if x > 0 and cell_id != grid[x - 1, y]:
+        energy += J[cell_type, types_as_grid[x - 1, y]]
+    if x < max_x - 1 and cell_id != grid[x + 1, y]:
+        energy += J[cell_type, types_as_grid[x + 1, y]]
+    if y > 0 and cell_id != grid[x, y - 1]:
+        energy += J[cell_type, types_as_grid[x, y - 1]]
+    if y < max_y - 1 and cell_id != grid[x, y + 1]:
+        energy += J[cell_type, types_as_grid[x, y + 1]]
+
+    return energy
+
+
+
+
+def cell_interaction_energy_old(
     cell_id: int,
     cell_type: int,
     grid: torch.tensor,
@@ -167,6 +211,50 @@ def delta_energy(
     V: float,
     lambda_v: float,
 ) -> float:
+    old_cell_id = grid[flip_x, flip_y]
+    old_volume_old_cell = torch.sum(grid == old_cell_id)
+    new_volume_old_cell = old_volume_old_cell - 1
+    old_volume_new_cell = torch.sum(grid == new_cell_id)
+    new_volume_new_cell = old_volume_new_cell + 1
+
+    d_volume_energy_old_cell = lambda_v * ((new_volume_old_cell - V) ** 2 - (old_volume_old_cell - V) ** 2)
+    if old_cell_id == 0:
+        d_volume_energy_old_cell = 0
+
+    d_volume_energy_new_cell = lambda_v * ((new_volume_new_cell - V) ** 2 - (old_volume_new_cell - V) ** 2)
+    if new_cell_id == 0:
+        d_volume_energy_new_cell = 0
+
+    old_type = cell_types[int(old_cell_id)]
+    new_type = cell_types[int(new_cell_id)]
+
+    old_neighbour_energy = cell_interaction_energy(
+        old_cell_id, old_type, grid, cell_types, types_as_grid, J, V, lambda_v, flip_x, flip_y
+    )
+    new_neighbour_energy = cell_interaction_energy(
+        new_cell_id, new_type, grid, cell_types, types_as_grid, J, V, lambda_v, flip_x, flip_y
+    )
+
+    return (
+        d_volume_energy_old_cell
+        + d_volume_energy_new_cell
+        + 2 * new_neighbour_energy
+        - 2 * old_neighbour_energy
+    )
+
+
+
+def delta_energy_old(
+    grid: torch.tensor,
+    cell_types: torch.tensor,
+    types_as_grid,
+    flip_x: int,
+    flip_y: int,
+    new_cell_id: int,
+    J: torch.tensor,
+    V: float,
+    lambda_v: float,
+) -> float:
     """Compute the energy difference of the system after flipping a cell
 
     Args:
@@ -213,8 +301,47 @@ def delta_energy(
         - 2 * old_neighbour_energy
     )
 
+def propose_flip(grid: torch.tensor, cell_types: torch.tensor) -> tuple[int, int, int]:
+    grid_size = grid.shape
+    while True:
+        # Randomly pick a cell in the grid
+        x = torch.randint(low=0, high=grid_size[0], size=(1,)).item()
+        y = torch.randint(low=0, high=grid_size[1], size=(1,)).item()
+        cell_id = grid[x, y]
 
-def propose_flip(
+        # Check neighbors using slicing and avoid edge cases
+        x_min = max(0, x-1)
+        x_max = min(x+2, grid_size[0])
+        y_min = max(0, y-1)
+        y_max = min(y+2, grid_size[1])
+
+        # Create a slice of the neighbors
+        neighbors = grid[x_min:x_max, y_min:y_max].flatten()
+
+        # Remove the selected cell from the neighbors list to check only the surrounding cells
+        neighbors = neighbors[neighbors != cell_id]
+
+        if len(neighbors) == 0 or torch.all(neighbors == cell_id):
+            continue
+
+        # Find unique neighboring cell types that are different from the current cell type
+        unique_neighbors = torch.unique(neighbors)
+        unique_neighbors = unique_neighbors[unique_neighbors != cell_id]
+
+        if len(unique_neighbors) == 0:
+            continue
+
+        # Calculate probabilities for each unique neighbor type
+        probabilities = torch.ones_like(unique_neighbors, dtype=torch.float)
+        probabilities /= probabilities.sum()
+
+        # Choose a new cell type randomly according to the probabilities
+        new_cell_id = unique_neighbors[torch.multinomial(probabilities, 1)]
+
+        return x, y, new_cell_id.item()
+
+
+def propose_flip_old(
     grid: torch.tensor, cell_types: torch.tensor
 ) -> tuple[int, int, int]:
     """Propose a cell to flip
@@ -347,7 +474,7 @@ J = torch.tensor(
         [16, 11, 16],
     ]
 )  # Interaction matrix
-V = 25  # Target volume
+V = 100  # Target volume
 lambda_v = 2  # volume constraint
 temperature = 10
 
@@ -360,8 +487,8 @@ start_energy = energy
 plt.ion()
 fig = plt.figure()
 ax = fig.add_subplot(111)
-img = ax.imshow(system.types_as_grid)
-# img = ax.imshow(np.asarray(system.grid))
+#img = ax.imshow(system.types_as_grid)
+img = ax.imshow(system.grid)
 
 for i in range(1000):
     system.grid, energy = mc_sweep(
@@ -373,10 +500,12 @@ for i in range(1000):
     ####fig.canvas.draw()
     fig.show()
     fig.canvas.flush_events()
-    print(f"Energy: {energy}")
+    #print(f"Energy: {energy}")
 
-    print(f"Start energy: {start_energy}")
-    print(f"Energy from de: {energy}")
-    print(
+    print(f"Grid:\nMax: {system.grid.max()}\nMin: {system.grid.min()}\n\n{system.grid}")
+
+    #print(f"Start energy: {start_energy}")
+    #print(f"Energy from de: {energy}")
+    #print(
     #f"Energy from hamiltonian: {hamiltonian(system.grid, system.cell_types,system.types_as_grid, J, V, lambda_v, n_cells)}"
-    )
+    #)
